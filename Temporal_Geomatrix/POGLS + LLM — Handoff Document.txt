@@ -1,0 +1,86 @@
+## POGLS + LLM — Handoff Document
+
+### จุดที่อยู่ตอนนี้
+
+**Infrastructure ✅ พร้อมใช้**
+```
+I:\llama\
+├── models\
+│   ├── qwen2.5-0.5b-instruct-q4_k_m.gguf      (General)
+│   └── qwen2.5-coder-1.5b-instruct-q4_k_m.gguf (Coder)
+├── bin\vulkan\llama-server.exe                  (Vulkan GPU build)
+├── start_servers.ps1                            (auto-start)
+├── pogls_llm_adapter.h                          (C adapter)
+└── test_llm_adapter.c                           (test harness)
+
+Servers:
+  port 8082 — General 0.5B  ~70 tok/sec
+  port 8083 — Coder   1.5B  ~40 tok/sec
+  GPU: 2x GTX 1050Ti Vulkan parallel
+  Latency: ~400ms local
+```
+
+**Adapter layer ✅ ทดสอบผ่าน**
+```c
+llm_adapter_init(&ctx)
+llm_adapter_add(&ctx, url, model)   // register specialist
+llm_dispatch_lane(&ctx, lane, prompt, ...)   // single
+llm_dispatch_parallel(&ctx, ids, prompts, n, ...)  // parallel
+```
+- TailsDNA cache: FNV-1a fingerprint, 16 slots ring buffer
+- lane % 3 routing: 0=General, 1=Coder, 2=Math(fallback)
+- parallel = pthread per specialist, total = slowest worker
+
+---
+
+### แผน integrate เข้า POGLS38
+
+**B — World State → Prompt Serializer**
+```c
+// delta/cell state → text query
+// ต้องออกแบบว่า POGLS world แปลงเป็น prompt ยังไง
+typedef struct {
+    uint32_t snap_id;
+    uint8_t  lane;
+    char     query[256];  // extracted from world state
+} POGLSQuery;
+```
+
+**C — Plug เข้า Wire Pipeline**
+```c
+// ใน l38_gpu_batch_feed() loop หลัง gate pass
+if (gr == GATE_PASS) {
+    POGLSQuery q = pogls_extract_query(h_hil[i], h_lane[i]);
+    llm_dispatch_lane(&llm_ctx, q.lane, q.query, 100, out, sizeof(out));
+    pogls_store_response(fed, snap_id, out);  // delta commit
+}
+```
+
+**D — Persistent TailsDNA Cache**
+```
+ตอนนี้: ring buffer 16 slots ใน RAM (หายตอน restart)
+ต้องการ: file-backed cache บน I:\llama\cache\
+key: FNV-1a hash → filename
+value: response text
+```
+
+**E — เพิ่ม Thai specialist (optional)**
+```
+Typhoon2-1.5B → port 8084
+lane % 4 routing เพิ่ม case 3 = Thai
+```
+
+---
+
+### ลำดับงานถัดไป
+
+```
+✅ A  start_servers.ps1 auto-start
+⬜ B  ออกแบบ POGLSQuery serializer
+⬜ C  plug llm_dispatch_lane() เข้า wire pipeline
+⬜ D  persistent cache (file-backed TailsDNA)
+⬜ E  Typhoon Thai specialist
+⬜ F  GUI / dashboard monitor
+```
+
+**B คือ critical path** — ต้องรู้ว่า world state จะ map เป็น prompt ยังไงก่อนทำ C ได้ครับ
